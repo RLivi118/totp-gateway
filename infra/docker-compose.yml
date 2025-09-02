@@ -1,0 +1,18 @@
+services:
+  gateway:
+    build: ./gateway
+    command: uvicorn app:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      - LABELS=certus:JBSWY3DPEHPK3PXP
+      - TOTP_PERIOD=30
+      - TOTP_DIGITS=6
+  bot:
+    build: ./bot
+    environment:
+      - ZULIP_ORG_URL=${ZULIP_ORG_URL}
+      - ZULIP_BOT_EMAIL=${ZULIP_BOT_EMAIL}
+      - ZULIP_BOT_TOKEN=${ZULIP_BOT_TOKEN}
+      - ALLOWED_SENDERS=${ALLOWED_SENDERS}
+      - GATEWAY_URL=http://gateway:8000

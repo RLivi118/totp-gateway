@@ -1,0 +1,14 @@
+[Unit]
+Description=TOTP Gateway (FastAPI)
+After=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/lsr/totp-gateway/gateway
+EnvironmentFile=/opt/lsr/totp-gateway/gateway/.env
+ExecStart=/opt/lsr/totp-gateway/gateway/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
