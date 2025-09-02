@@ -15,7 +15,7 @@ A small, demo-friendly setup that exposes a **TOTP code gateway** (FastAPI) and 
 
 ## Architecture
 
-``` mermaid
+```mermaid
 flowchart LR
   U[User (Zulip DM)] -- "!mfa-client-service" --> B[Zulip Bot]
   B -->|HTTP request| G[FastAPI Gateway]
