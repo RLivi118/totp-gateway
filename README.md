@@ -25,4 +25,4 @@ flowchart LR
   G --> S
   G -->|6-digit TOTP| B
   B -->|reply 123456| U
-
+```
