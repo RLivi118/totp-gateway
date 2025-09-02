@@ -1,0 +1,4 @@
+[api]
+email=totp-bot@your-org.zulipchat.com
+key=REPLACE_ME
+site=https://your-org.zulipchat.com
