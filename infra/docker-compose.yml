@@ -5,7 +5,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - LABELS=certus:JBSWY3DPEHPK3PXP
+      - LABELS=client-demo:JBSWY3DPEHPK3PXP
       - TOTP_PERIOD=30
       - TOTP_DIGITS=6
   bot:
