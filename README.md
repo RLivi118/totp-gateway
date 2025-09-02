@@ -96,7 +96,23 @@ Both routes return current 6-digit TOTPs based on the fake demo seed in `.env.ex
 
 ---
 
-## Security Best Practices
+## Demo Run (Local Test)
+
+Example of running the gateway locally and fetching a code:
+
+```bash
+$ curl "http://127.0.0.1:8000/totp/client/demo"
+{"client":"client","service":"demo","code":"619041","valid_for":30,"timestamp":"2025-09-02T22:15:00Z"}
+```
+
+- The `code` changes every 30 seconds (that's how TOTP works).
+- This output is from the **fake demo seed** in `.env.example` — never real secrets.
+
+---
+
+## Security Notes
+
+### Best Practices
 
 - **Never commit secrets**: All TOTP seeds stored in environment variables
 - **Network isolation**: Gateway should run behind VPN/firewall  
@@ -106,7 +122,7 @@ Both routes return current 6-digit TOTPs based on the fake demo seed in `.env.ex
 - **Time synchronization**: Ensure system clocks are synchronized between components
 - **Rate limiting**: Implement request throttling to prevent abuse
 
-### Production Security Notes
+### Production Considerations
 
 - This repo uses **fake demo seeds** only.  
 - In production, use KMS/Key Vault/Secrets Manager, seed rotation, and strict allowlisting.  
