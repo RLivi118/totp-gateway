@@ -4,6 +4,9 @@ import os
 import pyotp
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
+load_dotenv()
+
 app = FastAPI(title="TOTP Gateway (Demo + Realistic Routes)")
 
 def _load_label_map():
