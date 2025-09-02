@@ -1,171 +1,230 @@
+#!/usr/bin/env python3
 """
-Zulip TOTP Bot (sanitized demo)
-- DM commands:
-    1) !mfa-<client>-<service>
-    2) code <label>
-- Replies with current 6-digit TOTP fetched from the gateway.
-- Optional audit: posts an event to a stream (topic "channel events" by default).
-- All secrets must come from environment variables (.env) — never commit real values.
+LSR TOTP Bot (production-like, sanitized)
 
-Required env (see bot/.env.example):
-  ZULIP_ORG_URL="https://your-org.zulipchat.com"
-  ZULIP_BOT_EMAIL="totp-bot@your-org.zulipchat.com"
-  ZULIP_BOT_TOKEN="replace_me"
-  GATEWAY_URL="http://localhost:8000"  # demo
-  ALLOWED_SENDERS="alice@example.com,bob@example.com"  # optional, blank = allow all (demo)
-  AUDIT_STREAM="general"               # optional; if set, will post audit events
-  AUDIT_TOPIC="channel events"         # optional; default below
+Features:
+- Commands:
+    • !mfa-<client>-<service>    (DM or mention in stream)
+    • !mfa-help / !mfa
+- Channel access control: requester must be a member of #<client>
+- Audit logging: posts to client stream under topic "channel events", fallback to #general
+- Gateway call: GET {GATEWAY_URL}/totp/<client>/<service>
+  Optionally sends Authorization: Bearer <API_KEY> if API_KEY is set.
+- Secrets/config from zuliprc + environment variables.
 
-This demo talks to the portfolio gateway endpoint:
-  GET {GATEWAY_URL}/code?label=<label>
+Env (all optional but recommended):
+  GATEWAY_URL="http://localhost:8000"   # demo default
+  API_KEY=""                             # if set, add Authorization: Bearer <API_KEY>
+  AUDIT_TOPIC="channel events"
+  FALLBACK_STREAM="general"
+  ZULIPRC_PATH="./zuliprc"               # path to zuliprc (default: ./zuliprc)
+
+Safety:
+- No real client names, URLs, or tokens appear in this repository.
+- Never commit a real zuliprc; only commit zuliprc.example.
 """
 
 import os
 import re
 import time
-import json
+import logging
+from typing import List, Dict, Optional
+
 import requests
-from typing import Optional
-from dotenv import load_dotenv
+import zulip  # official zulip client
 
-load_dotenv()
-
-ORG = os.getenv("ZULIP_ORG_URL", "").rstrip("/")
-BOT_EMAIL = os.getenv("ZULIP_BOT_EMAIL", "")
-BOT_TOKEN = os.getenv("ZULIP_BOT_TOKEN", "")
+# ---------- Config ----------
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://localhost:8000").rstrip("/")
-ALLOWED_SENDERS = {
-    s.strip().lower() for s in os.getenv("ALLOWED_SENDERS", "").split(",") if s.strip()
-}
-AUDIT_STREAM = os.getenv("AUDIT_STREAM", "").strip()
+API_KEY = os.getenv("API_KEY", "").strip()  # optional; when set we add Bearer token
 AUDIT_TOPIC = os.getenv("AUDIT_TOPIC", "channel events").strip() or "channel events"
+FALLBACK_STREAM = os.getenv("FALLBACK_STREAM", "general").strip() or "general"
+ZULIPRC_PATH = os.getenv("ZULIPRC_PATH", "./zuliprc")
 
-if not (ORG and BOT_EMAIL and BOT_TOKEN):
-    raise SystemExit("Missing required env: ZULIP_ORG_URL, ZULIP_BOT_EMAIL, ZULIP_BOT_TOKEN")
+# Demo: sanitized mapping for display names (safe placeholders only)
+SERVICE_DISPLAY = {
+    "gmail": "Gmail",
+    "aws": "AWS",
+    "slack": "Slack",
+    "microsoft": "Microsoft",
+    "github": "GitHub",
+    "demo": "Demo",
+}
 
-API = f"{ORG}/api/v1"
-session = requests.Session()
-session.auth = (BOT_EMAIL, BOT_TOKEN)
-session.headers.update({"User-Agent": "lsr-totp-bot/1.0"})
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("lsr-totp-bot")
 
-CMD_MFA = re.compile(r"^!mfa-([a-z0-9_\-]+)-([a-z0-9_\-]+)$", re.IGNORECASE)
-CMD_CODE = re.compile(r"^code\s+([^\s]+)$", re.IGNORECASE)  # label may include dashes/underscores
+# ---------- Command patterns ----------
+CMD_HELP = re.compile(r"(^|\s)!mfa(\s|$)|(^|\s)!mfa-help(\s|$)", re.IGNORECASE)
+CMD_MFA = re.compile(r"!mfa-(?!help\b)([a-z0-9_]+)-([a-z0-9_]+)\b", re.IGNORECASE)
 
-def _send_dm(user_id: int, content: str) -> None:
-    r = session.post(f"{API}/messages", data={"type": "private", "to": [user_id], "content": content}, timeout=10)
-    r.raise_for_status()
+# ---------- Helpers ----------
+def create_client() -> zulip.Client:
+    # use zuliprc exactly like production; never commit a real one
+    return zulip.Client(config_file=ZULIPRC_PATH)
 
-def _send_stream(stream: str, topic: str, content: str) -> None:
-    if not stream:
-        return
-    payload = {"type": "stream", "to": stream, "topic": topic, "content": content}
-    r = session.post(f"{API}/messages", data=payload, timeout=10)
-    r.raise_for_status()
+def get_self_identity(client: zulip.Client):
+    prof = client.get_profile()
+    if prof.get("result") == "success":
+        return prof.get("email"), prof.get("user_id")
+    return None, None
 
-def _register_queue() -> dict:
-    r = session.post(f"{API}/register", data={"event_types": json.dumps(["messages"])}, timeout=15)
-    r.raise_for_status()
-    return r.json()
+def list_streams(client: zulip.Client) -> Dict[str, dict]:
+    res = client.get_streams()
+    if res.get("result") != "success":
+        raise RuntimeError(f"get_streams failed: {res}")
+    # name(lower) -> metadata
+    return {s["name"].lower(): s for s in res.get("streams", [])}
 
-def _get_events(queue_id: str, last_event_id: int) -> dict:
-    r = session.get(
-        f"{API}/events",
-        params={"queue_id": queue_id, "last_event_id": last_event_id, "dont_block": False, "timeout": 90},
-        timeout=95,
-    )
-    r.raise_for_status()
-    return r.json()
+def get_user_id_and_name(client: zulip.Client, email: str) -> (Optional[int], str):
+    res = client.get_users()
+    if res.get("result") == "success":
+        for m in res.get("members", []):
+            if m.get("email") == email:
+                return m.get("user_id"), m.get("full_name") or email.split("@")[0]
+    # fallback
+    return None, email.split("@")[0]
 
-def _fetch_code_for_label(label: str) -> str:
-    # Gateway demo endpoint: /code?label=...
-    r = requests.get(f"{GATEWAY_URL}/code", params={"label": label}, timeout=6)
-    if r.status_code == 404:
-        return "Unknown label."
-    r.raise_for_status()
-    data = r.json()
-    return data.get("code", "error")
+def user_stream_memberships(client: zulip.Client, user_id: int, stream_map: Dict[str, dict]) -> List[str]:
+    """Return list of stream names (lowercase) that contain the user."""
+    memberships = []
+    for name, meta in stream_map.items():
+        res = client.get_subscribers(stream=name)
+        if res.get("result") == "success":
+            if user_id in res.get("subscribers", []):
+                memberships.append(name)
+    return memberships
 
-def _allowed(sender_email: str) -> bool:
-    return (not ALLOWED_SENDERS) or (sender_email.lower() in ALLOWED_SENDERS)
+def in_client_stream(client: zulip.Client, client_name: str, user_id: int, stream_map: Dict[str, dict]) -> bool:
+    """Require membership in #<client_name>."""
+    subs = client.get_subscribers(stream=client_name)
+    if subs.get("result") != "success":
+        return False
+    return user_id in subs.get("subscribers", [])
 
-def _handle_text(text: str) -> Optional[str]:
-    """
-    Returns the label to use with the gateway, or None if the text isn't a command.
-    - '!mfa-client-service'  -> label 'client-service'
-    - 'code label'           -> label 'label'
-    """
-    m1 = CMD_MFA.match(text)
-    if m1:
-        client, service = m1.group(1), m1.group(2)
-        return f"{client}-{service}"
+def send_dm(client: zulip.Client, to_email: str, content: str):
+    client.send_message({"type": "private", "to": [to_email], "content": content})
 
-    m2 = CMD_CODE.match(text)
-    if m2:
-        return m2.group(1)
+def send_stream_message(client: zulip.Client, stream_name: str, topic: str, content: str) -> bool:
+    stream_map = list_streams(client)
+    meta = stream_map.get(stream_name.lower())
+    if not meta:
+        log.error("No such stream #%s", stream_name)
+        return False
+    payload = {"type": "stream", "to": meta["stream_id"], "topic": topic, "content": content}
+    res = client.send_message(payload)
+    return res.get("result") == "success"
 
-    if text.strip().lower() in {"!mfa-help", "help"}:
-        return ""  # special marker to print help
-
-    return None
+def fetch_totp(label_client: str, label_service: str, requester_email: str) -> (bool, str, Optional[dict]):
+    """Call portfolio gateway route /totp/<client>/<service>"""
+    url = f"{GATEWAY_URL}/totp/{label_client}/{label_service}"
+    headers = {"X-Zulip-User": requester_email}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 404:
+            return False, "Unknown label.", None
+        r.raise_for_status()
+        data = r.json()
+        return True, "", data
+    except Exception as e:
+        return False, f"Gateway error: {e}", None
 
 HELP_TEXT = (
-    "**TOTP bot (demo):**\n"
-    "• `!mfa-<client>-<service>` → replies with current 6-digit code for that label\n"
-    "• `code <label>` → same as above (demo-friendly)\n"
-    "_Notes:_ Allowed senders only (if configured). All secrets live in env/secret manager."
+    "🔐 **TOTP Bot — Usage**\n\n"
+    "**Commands**\n"
+    "• `!mfa-<client>-<service>` — DM me or mention me in the right stream\n"
+    "• `!mfa-help` — show this help\n\n"
+    "**Access control**\n"
+    "• You must be a member of `#<client>` to request codes for that client.\n\n"
+    "**Audit**\n"
+    f"• Logs to the client’s stream under topic **“{AUDIT_TOPIC}”**, fallback to `#{FALLBACK_STREAM}`.\n"
 )
 
-def main() -> None:
-    print("Registering Zulip event queue…")
-    q = _register_queue()
-    queue_id = q["queue_id"]
-    last_event_id = q["last_event_id"]
-    print("Listening for DMs…")
+def main():
+    client = create_client()
+    me_email, me_id = get_self_identity(client)
+    log.info("Bot started. me_email=%s me_id=%s gateway=%s", me_email, me_id, GATEWAY_URL)
 
-    while True:
-        try:
-            ev = _get_events(queue_id, last_event_id)
-            for e in ev.get("events", []):
-                last_event_id = e["id"]
-                if e.get("type") != "message":
-                    continue
+    def handler(event):
+        if event.get("type") != "message":
+            return
 
-                msg = e.get("message", {})
-                if msg.get("type") != "private":  # DM only
-                    continue
+        msg = event.get("message", {})
+        text = (msg.get("content") or "").strip()
+        msg_type = msg.get("type")
+        sender_email = msg.get("sender_email", "")
+        sender_id = msg.get("sender_id")
 
-                sender_email = (msg.get("sender_email") or "").lower()
-                if not _allowed(sender_email):
-                    continue  # silently ignore disallowed senders in demo
+        # Ignore ourselves / other bots
+        if (me_id is not None and sender_id == me_id) or msg.get("sender_is_bot"):
+            return
 
-                text = (msg.get("content") or "").strip()
-                label = _handle_text(text)
+        # Only respond to DMs or mentions
+        if msg_type != "private" and "@**" not in text:
+            return
 
-                if label is None:  # not a command
-                    continue
+        # Help
+        if CMD_HELP.search(text):
+            send_dm(client, sender_email, HELP_TEXT)
+            return
 
-                if label == "":   # help
-                    _send_dm(msg["sender_id"], HELP_TEXT)
-                    continue
+        # Parse !mfa-client-service
+        m = CMD_MFA.search(text.lower())
+        if not m:
+            return
+        label_client, label_service = m.group(1), m.group(2)
 
-                # Fetch code
-                code = _fetch_code_for_label(label)
-                _send_dm(msg["sender_id"], f"`{label}` → **{code}**")
+        # Access control: must be in #<client>
+        stream_map = list_streams(client)
+        user_id, display_name = get_user_id_and_name(client, sender_email)
+        if user_id is None or not in_client_stream(client, label_client, user_id, stream_map):
+            send_dm(
+                client,
+                sender_email,
+                f"❌ **Access Denied**\n\n"
+                f"You must be in **#{label_client}** to request `{label_service}` codes.\n"
+                f"Please contact an admin for access."
+            )
+            # Log denial (try client stream, then fallback)
+            denied = f"❌ {display_name} requested {SERVICE_DISPLAY.get(label_service, label_service)} MFA → Access denied (not in #{label_client})"
+            if not send_stream_message(client, label_client, AUDIT_TOPIC, denied):
+                send_stream_message(client, FALLBACK_STREAM, AUDIT_TOPIC, f"{denied} (logged here)")
+            return
 
-                # Optional audit
-                if AUDIT_STREAM:
-                    _send_stream(
-                        AUDIT_STREAM,
-                        AUDIT_TOPIC,
-                        f"requester: `{sender_email}` • label: `{label}` • replied in DM",
-                    )
+        # Fetch code from gateway
+        ok, err, data = fetch_totp(label_client, label_service, sender_email)
+        if not ok:
+            send_dm(client, sender_email, f"❌ {err}")
+            msg_txt = f"⚠️ {display_name} requested {SERVICE_DISPLAY.get(label_service, label_service)} MFA → ❌ {err}"
+            if not send_stream_message(client, label_client, AUDIT_TOPIC, msg_txt):
+                send_stream_message(client, FALLBACK_STREAM, AUDIT_TOPIC, f"{msg_txt} (logged here)")
+            return
 
-        except requests.HTTPError as he:
-            print("HTTP error:", he)
-            time.sleep(2)
-        except Exception as ex:
-            print("Error:", ex)
-            time.sleep(2)
+        # Reply in DM
+        code = data.get("code", "error")
+        valid_for = data.get("valid_for", 30)
+        ts = (data.get("timestamp") or "")[:19]
+        dm_text = (
+            f"🔐 **{SERVICE_DISPLAY.get(label_service, label_service)}** "
+            f"({label_client}): `{code}`\n"
+            f"⏰ Valid for {valid_for} seconds\n"
+            f"🕒 Generated at {ts}"
+        )
+        send_dm(client, sender_email, dm_text)
+
+        # Audit success
+        log_txt = f"🔐 {display_name} requested {SERVICE_DISPLAY.get(label_service, label_service)} MFA → ✅ Code sent to DM"
+        if not send_stream_message(client, label_client, AUDIT_TOPIC, log_txt):
+            send_stream_message(client, FALLBACK_STREAM, AUDIT_TOPIC, f"{log_txt} (logged here)")
+
+    client.call_on_each_message(handler)
 
 if __name__ == "__main__":
-    main()
+    while True:
+        try:
+            main()
+        except Exception as e:
+            log.error("Fatal error: %s", e)
+            time.sleep(2)
